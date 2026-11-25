@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/base64"
+	"encoding/csv"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -40,10 +41,15 @@ func unlistedSAC(t *testing.T) string {
 }
 
 type fake struct {
-	assets  []coverage.Asset
-	supply  map[string]*coverage.Supply
-	reports map[string]map[uint32]coverage.Report
-	bodies  map[string][]byte
+	assets        []coverage.Asset
+	supply        map[string]*coverage.Supply
+	reports       map[string]map[uint32]coverage.Report
+	bodies        map[string][]byte
+	exportPages   [][]store.ReportExportRow
+	exportCalls   int
+	exportFrom    *time.Time
+	exportTo      *time.Time
+	exportCursors []*store.ReportExportCursor
 }
 
 func (f *fake) Ping(context.Context) error { return nil }
@@ -79,6 +85,18 @@ func (f *fake) ReportHistory(_ context.Context, s string, _ int) ([]coverage.Rep
 		out = append(out, r)
 	}
 	return out, nil
+}
+func (f *fake) ReportExportPage(_ context.Context, _ string, from, to *time.Time, after *store.ReportExportCursor, _ int) ([]store.ReportExportRow, error) {
+	if f.exportCalls == 0 {
+		f.exportFrom, f.exportTo = from, to
+	}
+	f.exportCalls++
+	f.exportCursors = append(f.exportCursors, after)
+	pageIndex := f.exportCalls - 1
+	if pageIndex >= len(f.exportPages) {
+		return nil, nil
+	}
+	return f.exportPages[pageIndex], nil
 }
 func (f *fake) Reporters(context.Context) ([]coverage.Reporter, error) {
 	return []coverage.Reporter{{Address: "GAUD", Role: coverage.RoleAuditor, Name: "Acme"}}, nil
@@ -289,6 +307,70 @@ func TestListedAssetHistory(t *testing.T) {
 	if got := get(t, srv, "/v1/assets/"+sac+"/reports", 200)["reports"].([]any); len(got) != 1 {
 		t.Fatalf("report history %+v", got)
 	}
+}
+
+func TestReportExportStreamsPagesAndAppliesDateFilters(t *testing.T) {
+	f := &fake{
+		assets: []coverage.Asset{{SAC: sac}},
+		exportPages: [][]store.ReportExportRow{
+			makeExportRows(500),
+			makeExportRows(1),
+		},
+	}
+	f.exportPages[0][len(f.exportPages[0])-1].Cursor = store.ReportExportCursor{Ledger: 599, EventID: "event-599"}
+	f.exportPages[1][0].Cursor = store.ReportExportCursor{Ledger: 600, EventID: "event-600"}
+	srv := httptest.NewServer((&Server{
+		Store: f,
+		Log:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}).Handler())
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/v1/assets/" + sac + "/reports/export.csv?from=2026-10-01&to=2026-10-05")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status %d, want 200", resp.StatusCode)
+	}
+	if got := resp.Header.Get("Content-Disposition"); got != `attachment; filename="reports-`+sac+`.csv"` {
+		t.Fatalf("Content-Disposition = %q", got)
+	}
+	if got := resp.Header.Get("Content-Type"); !strings.HasPrefix(got, "text/csv") {
+		t.Fatalf("Content-Type = %q", got)
+	}
+	records, err := csv.NewReader(resp.Body).ReadAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 502 || strings.Join(records[0], ",") != "ledger,timestamp,reporter,bps,tier,doc_uri" {
+		t.Fatalf("CSV has %d records and header %v", len(records), records[0])
+	}
+	if got := strings.Join(records[1], ","); got != "100,2026-10-05T10:00:00Z,GREPORTER,10200,issuer_signed,https://example.test/report" {
+		t.Fatalf("first report record = %q", got)
+	}
+	if f.exportCalls != 2 || f.exportCursors[1] == nil ||
+		f.exportCursors[1].Ledger != 599 || f.exportCursors[1].EventID != "event-599" {
+		t.Fatalf("page calls/cursor = %d / %+v", f.exportCalls, f.exportCursors)
+	}
+	if f.exportFrom == nil || !f.exportFrom.Equal(time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)) ||
+		f.exportTo == nil || !f.exportTo.Equal(time.Date(2026, 10, 6, 0, 0, 0, 0, time.UTC)) {
+		t.Fatalf("date bounds = %v / %v", f.exportFrom, f.exportTo)
+	}
+}
+
+func makeExportRows(n int) []store.ReportExportRow {
+	rows := make([]store.ReportExportRow, n)
+	bps := uint32(10_200)
+	for i := range rows {
+		rows[i] = store.ReportExportRow{
+			Ledger: uint32(100 + i), Timestamp: now.Add(-2 * time.Hour),
+			Reporter: "GREPORTER", Bps: &bps,
+			Tier: coverage.TierIssuerSigned, DocURI: "https://example.test/report",
+			Cursor: store.ReportExportCursor{Ledger: int64(100 + i), EventID: "event"},
+		}
+	}
+	return rows
 }
 
 func TestCORSHeader(t *testing.T) {

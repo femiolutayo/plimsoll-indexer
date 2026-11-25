@@ -214,3 +214,55 @@ func TestWebhookPersistence(t *testing.T) {
 		t.Fatalf("delete missing webhook: deleted=%v err=%v", deleted, err)
 	}
 }
+
+func TestReportExportPageFiltersAndUsesHistoricalSupply(t *testing.T) {
+	s, url := openStore(t)
+	ctx := context.Background()
+	sac := "CEXPORT"
+	execSQL(t, url, `
+		INSERT INTO supply_snapshots
+		  (event_id, sac, amount, at_ledger, breakdown_hash, poster, posted_ledger, posted_at, tx_hash)
+		VALUES
+		  ('supply-1', $1, 1000, 10, 'hash-1', 'poster', 11, '2026-10-01T00:00:00Z', 'tx-1'),
+		  ('supply-2', $1, 2000, 20, 'hash-2', 'poster', 21, '2026-10-03T18:00:00Z', 'tx-2')`, sac)
+	for _, report := range []struct {
+		id, at, amount string
+		ledger         int
+	}{
+		{"report-1", "2026-10-03T12:00:00Z", "1020", 30},
+		{"report-2", "2026-10-04T12:00:00Z", "3000", 40},
+		{"report-3", "2026-10-06T12:00:00Z", "4000", 50},
+	} {
+		execSQL(t, url, `
+			INSERT INTO reserve_reports
+			  (event_id, sac, tier, amount, as_of, reporter, doc_hash, doc_uri, posted_ledger, posted_at, tx_hash)
+			VALUES ($1, $2, 2, $3, $4, 'reporter', 'doc-hash', 'https://example.test/report', $5, $4, 'tx')`,
+			report.id, sac, report.amount, report.at, report.ledger)
+	}
+
+	from := time.Date(2026, 10, 3, 0, 0, 0, 0, time.UTC)
+	to := time.Date(2026, 10, 5, 0, 0, 0, 0, time.UTC)
+	first, err := s.ReportExportPage(ctx, sac, &from, &to, nil, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(first) != 1 || first[0].Ledger != 30 || first[0].Cursor.EventID != "report-1" ||
+		first[0].Bps == nil || *first[0].Bps != 10_200 {
+		t.Fatalf("first report page = %+v", first)
+	}
+	second, err := s.ReportExportPage(ctx, sac, &from, &to, &first[0].Cursor, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(second) != 1 || second[0].Ledger != 40 || second[0].Cursor.EventID != "report-2" ||
+		second[0].Bps == nil || *second[0].Bps != 15_000 {
+		t.Fatalf("second report page = %+v", second)
+	}
+	third, err := s.ReportExportPage(ctx, sac, &from, &to, &second[0].Cursor, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(third) != 0 {
+		t.Fatalf("reports outside date range = %+v", third)
+	}
+}

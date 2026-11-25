@@ -235,6 +235,59 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+  /v1/assets/{sac}/reports/export.csv:
+    get:
+      summary: Export complete reserve report history for an asset
+      operationId: exportReportHistory
+      parameters:
+        - name: sac
+          in: path
+          required: true
+          description: Stellar Asset Contract (SAC) address
+          schema:
+            type: string
+            pattern: '^C[A-Z2-7]{55}$'
+        - name: from
+          in: query
+          required: false
+          description: Include reports posted on or after this UTC date
+          schema:
+            type: string
+            format: date
+        - name: to
+          in: query
+          required: false
+          description: Include reports posted through this UTC date
+          schema:
+            type: string
+            format: date
+      responses:
+        '200':
+          description: CSV report history, paginated internally
+          headers:
+            Content-Disposition:
+              description: Indicates that the CSV is an attachment
+              schema:
+                type: string
+          content:
+            text/csv:
+              schema:
+                type: string
+                example: |-
+                  ledger,timestamp,reporter,bps,tier,doc_uri
+                  42,2026-10-05T12:00:00Z,G...,10200,issuer_signed,https://example.test/report
+        '400':
+          description: Invalid date parameter, or sac is not a contract strkey
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Asset not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
   /v1/reporters:
     get:
       summary: List registered reporters and their roles

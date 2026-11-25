@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/subtle"
 	_ "embed"
+	"encoding/csv"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -35,6 +36,7 @@ type Reader interface {
 	SupplyHistory(ctx context.Context, sac string, limit int) ([]coverage.Supply, error)
 	LatestReports(ctx context.Context, sac string) (map[uint32]coverage.Report, error)
 	ReportHistory(ctx context.Context, sac string, limit int) ([]coverage.Report, error)
+	ReportExportPage(ctx context.Context, sac string, from, to *time.Time, after *store.ReportExportCursor, limit int) ([]store.ReportExportRow, error)
 	Reporters(ctx context.Context) ([]coverage.Reporter, error)
 	Breakdown(ctx context.Context, hash string) ([]byte, error)
 	Progress(ctx context.Context, name string) (store.Progress, error)
@@ -75,6 +77,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/assets/{sac}", s.getAsset)
 	mux.HandleFunc("GET /v1/assets/{sac}/supply", s.supplyHistory)
 	mux.HandleFunc("GET /v1/assets/{sac}/reports", s.reportHistory)
+	mux.HandleFunc("GET /v1/assets/{sac}/reports/export.csv", s.reportExport)
 	mux.HandleFunc("GET /v1/reporters", s.reporters)
 	mux.HandleFunc("GET /v1/breakdowns/{hash}", s.breakdown)
 	mux.HandleFunc("POST /v1/webhooks", s.createWebhook)
@@ -333,6 +336,72 @@ func (s *Server) reportHistory(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"reports": out})
 }
 
+const reportExportPageSize = 500
+
+func (s *Server) reportExport(w http.ResponseWriter, r *http.Request) {
+	sac, ok := parseSAC(w, r)
+	if !ok {
+		return
+	}
+	from, to, ok := parseDateRange(w, r)
+	if !ok {
+		return
+	}
+	if !s.requireAsset(w, r, sac) {
+		return
+	}
+
+	page, err := s.Store.ReportExportPage(r.Context(), sac, from, to, nil, reportExportPageSize)
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
+	w.Header().Set("Content-Disposition", `attachment; filename="reports-`+sac+`.csv"`)
+	writer := csv.NewWriter(w)
+	if err := writer.Write([]string{"ledger", "timestamp", "reporter", "bps", "tier", "doc_uri"}); err != nil {
+		s.Log.Error("write report export", "err", err)
+		return
+	}
+
+	var cursor *store.ReportExportCursor
+	for {
+		for _, row := range page {
+			bps := ""
+			if row.Bps != nil {
+				bps = strconv.FormatUint(uint64(*row.Bps), 10)
+			}
+			record := []string{
+				strconv.FormatUint(uint64(row.Ledger), 10),
+				row.Timestamp.UTC().Format(time.RFC3339Nano),
+				row.Reporter,
+				bps,
+				coverage.TierName(row.Tier),
+				row.DocURI,
+			}
+			if err := writer.Write(record); err != nil {
+				s.Log.Error("write report export", "err", err)
+				return
+			}
+		}
+		if len(page) < reportExportPageSize {
+			break
+		}
+		next := page[len(page)-1].Cursor
+		cursor = &next
+		page, err = s.Store.ReportExportPage(r.Context(), sac, from, to, cursor, reportExportPageSize)
+		if err != nil {
+			s.Log.Error("read report export page", "err", err)
+			return
+		}
+	}
+	writer.Flush()
+	if err := writer.Error(); err != nil {
+		s.Log.Error("flush report export", "err", err)
+	}
+}
+
 func (s *Server) reporters(w http.ResponseWriter, r *http.Request) {
 	list, err := s.Store.Reporters(r.Context())
 	if err != nil {
@@ -532,6 +601,38 @@ func parseLimit(w http.ResponseWriter, r *http.Request) (int, bool) {
 		return 0, false
 	}
 	return n, true
+}
+
+func parseDateRange(w http.ResponseWriter, r *http.Request) (*time.Time, *time.Time, bool) {
+	parse := func(name string) (*time.Time, bool) {
+		value := r.URL.Query().Get(name)
+		if value == "" {
+			return nil, true
+		}
+		date, err := time.Parse("2006-01-02", value)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, name+" must be a date in YYYY-MM-DD format")
+			return nil, false
+		}
+		date = date.UTC()
+		if name == "to" {
+			date = date.AddDate(0, 0, 1)
+		}
+		return &date, true
+	}
+	from, ok := parse("from")
+	if !ok {
+		return nil, nil, false
+	}
+	to, ok := parse("to")
+	if !ok {
+		return nil, nil, false
+	}
+	if from != nil && to != nil && !from.Before(*to) {
+		writeError(w, http.StatusBadRequest, "from must be on or before to")
+		return nil, nil, false
+	}
+	return from, to, true
 }
 
 func (s *Server) cors(next http.Handler) http.Handler {
