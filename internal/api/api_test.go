@@ -68,6 +68,7 @@ func (f *fake) SupplyHistory(_ context.Context, s string, _ int) ([]coverage.Sup
 	}
 	return nil, nil
 }
+func (f *fake) SupplyHistoryCount(context.Context, string) (int64, error) { return 12, nil }
 func (f *fake) LatestReports(_ context.Context, s string) (map[uint32]coverage.Report, error) {
 	if r := f.reports[s]; r != nil {
 		return r, nil
@@ -81,6 +82,7 @@ func (f *fake) ReportHistory(_ context.Context, s string, _ int) ([]coverage.Rep
 	}
 	return out, nil
 }
+func (f *fake) ReportHistoryCount(context.Context, string) (int64, error) { return 34, nil }
 func (f *fake) Reporters(context.Context) ([]coverage.Reporter, error) {
 	return []coverage.Reporter{{Address: "GAUD", Role: coverage.RoleAuditor, Name: "Acme"}}, nil
 }
@@ -399,6 +401,40 @@ func TestListedAssetHistory(t *testing.T) {
 	}
 }
 
+func TestHistoryTotalCountHeaders(t *testing.T) {
+	srv := server()
+	defer srv.Close()
+	for _, tc := range []struct {
+		path, key, total string
+	}{
+		{"/v1/assets/" + sac + "/supply?limit=1", "supply", "12"},
+		{"/v1/assets/" + sac + "/reports?limit=1", "reports", "34"},
+	} {
+		resp, err := http.Get(srv.URL + tc.path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var body map[string]json.RawMessage
+		decodeErr := json.NewDecoder(resp.Body).Decode(&body)
+		resp.Body.Close()
+		if decodeErr != nil {
+			t.Fatalf("%s: decode: %v", tc.path, decodeErr)
+		}
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("%s: status %d want %d", tc.path, resp.StatusCode, http.StatusOK)
+		}
+		if got := resp.Header.Get("X-Total-Count"); got != tc.total {
+			t.Errorf("%s: X-Total-Count %q want %q", tc.path, got, tc.total)
+		}
+		var items []json.RawMessage
+		if err := json.Unmarshal(body[tc.key], &items); err != nil {
+			t.Errorf("%s: decode %s: %v", tc.path, tc.key, err)
+		} else if len(items) != 1 {
+			t.Errorf("%s: returned %d rows with limit=1, want 1", tc.path, len(items))
+		}
+	}
+}
+
 func TestCORSHeader(t *testing.T) {
 	srv := server()
 	defer srv.Close()
@@ -411,6 +447,17 @@ func TestCORSHeader(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusNoContent || resp.Header.Get("Access-Control-Allow-Origin") != "*" {
 		t.Fatalf("status %d, header %q", resp.StatusCode, resp.Header.Get("Access-Control-Allow-Origin"))
+	}
+
+	req, _ = http.NewRequest(http.MethodGet, srv.URL+"/v1/assets/"+sac+"/supply", nil)
+	req.Header.Set("Origin", "https://plimsoll.example")
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if got := resp.Header.Get("Access-Control-Expose-Headers"); got != "X-Total-Count" {
+		t.Fatalf("Access-Control-Expose-Headers = %q, want X-Total-Count", got)
 	}
 }
 
@@ -434,6 +481,9 @@ func TestOpenAPISpec(t *testing.T) {
 	}
 	if !strings.Contains(string(body), "operationId: headAsset") {
 		t.Error("expected the spec to document the HEAD asset operation")
+	}
+	if strings.Count(string(body), "X-Total-Count:") != 2 {
+		t.Error("expected the spec to document X-Total-Count on both history endpoints")
 	}
 }
 

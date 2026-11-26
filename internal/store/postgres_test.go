@@ -275,6 +275,45 @@ func TestApplyEventsIsIdempotentAcrossReconnect(t *testing.T) {
 	}
 }
 
+func TestHistoryCounts(t *testing.T) {
+	s, url := openStore(t)
+	ctx := context.Background()
+	execSQL(t, url, `
+		INSERT INTO supply_snapshots
+		  (event_id, sac, amount, at_ledger, breakdown_hash, poster, posted_ledger, posted_at, tx_hash)
+		VALUES
+		  ('supply-1', 'CSAC', 5, 10, 'hash', 'GPOSTER', 10, now(), 'tx'),
+		  ('supply-2', 'CSAC', 5, 11, 'hash', 'GPOSTER', 11, now(), 'tx'),
+		  ('supply-other', 'COTHER', 5, 10, 'hash', 'GPOSTER', 10, now(), 'tx')`)
+	execSQL(t, url, `
+		INSERT INTO reserve_reports
+		  (event_id, sac, tier, amount, as_of, reporter, doc_hash, doc_uri, posted_ledger, posted_at, tx_hash)
+		VALUES
+		  ('report-1', 'CSAC', 1, 5, now(), 'GREPORTER', 'hash', 'https://example.com', 10, now(), 'tx'),
+		  ('report-2', 'CSAC', 2, 5, now(), 'GREPORTER', 'hash', 'https://example.com', 11, now(), 'tx'),
+		  ('report-other', 'COTHER', 1, 5, now(), 'GREPORTER', 'hash', 'https://example.com', 10, now(), 'tx')`)
+
+	for _, tc := range []struct {
+		name  string
+		count func(context.Context, string) (int64, error)
+	}{
+		{"supply", s.SupplyHistoryCount},
+		{"reports", s.ReportHistoryCount},
+	} {
+		for _, want := range []struct {
+			sac   string
+			count int64
+		}{{"CSAC", 2}, {"COTHER", 1}, {"CEMPTY", 0}} {
+			got, err := tc.count(ctx, want.sac)
+			if err != nil {
+				t.Errorf("%s count for %s: %v", tc.name, want.sac, err)
+			} else if got != want.count {
+				t.Errorf("%s count for %s = %d, want %d", tc.name, want.sac, got, want.count)
+			}
+		}
+	}
+}
+
 func TestEventIDMigrationRepairsLegacyTables(t *testing.T) {
 	url := newDatabase(t)
 	schema := strings.ReplaceAll(legacySchema(t),

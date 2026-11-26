@@ -35,8 +35,10 @@ type Reader interface {
 	GetAsset(ctx context.Context, sac string) (coverage.Asset, error)
 	LatestSupply(ctx context.Context, sac string) (*coverage.Supply, error)
 	SupplyHistory(ctx context.Context, sac string, limit int) ([]coverage.Supply, error)
+	SupplyHistoryCount(ctx context.Context, sac string) (int64, error)
 	LatestReports(ctx context.Context, sac string) (map[uint32]coverage.Report, error)
 	ReportHistory(ctx context.Context, sac string, limit int) ([]coverage.Report, error)
+	ReportHistoryCount(ctx context.Context, sac string) (int64, error)
 	Reporters(ctx context.Context) ([]coverage.Reporter, error)
 	Breakdown(ctx context.Context, hash string) ([]byte, error)
 	Progress(ctx context.Context, name string) (store.Progress, error)
@@ -324,6 +326,11 @@ func (s *Server) supplyHistory(w http.ResponseWriter, r *http.Request) {
 	if !s.requireAsset(w, r, sac) {
 		return
 	}
+	total, err := s.Store.SupplyHistoryCount(r.Context(), sac)
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
 	list, err := s.Store.SupplyHistory(r.Context(), sac, limit)
 	if err != nil {
 		s.fail(w, err)
@@ -333,6 +340,7 @@ func (s *Server) supplyHistory(w http.ResponseWriter, r *http.Request) {
 	for i := range list {
 		out = append(out, toSupply(&list[i]))
 	}
+	w.Header().Set("X-Total-Count", strconv.FormatInt(total, 10))
 	writeJSON(w, http.StatusOK, map[string]any{"supply": out})
 }
 
@@ -348,6 +356,11 @@ func (s *Server) reportHistory(w http.ResponseWriter, r *http.Request) {
 	if !s.requireAsset(w, r, sac) {
 		return
 	}
+	total, err := s.Store.ReportHistoryCount(r.Context(), sac)
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
 	list, err := s.Store.ReportHistory(r.Context(), sac, limit)
 	if err != nil {
 		s.fail(w, err)
@@ -357,6 +370,7 @@ func (s *Server) reportHistory(w http.ResponseWriter, r *http.Request) {
 	for _, rep := range list {
 		out = append(out, toReport(rep))
 	}
+	w.Header().Set("X-Total-Count", strconv.FormatInt(total, 10))
 	writeJSON(w, http.StatusOK, map[string]any{"reports": out})
 }
 
@@ -584,6 +598,7 @@ func (s *Server) cors(next http.Handler) http.Handler {
 		}
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
+		w.Header().Set("Access-Control-Expose-Headers", "X-Total-Count")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return
