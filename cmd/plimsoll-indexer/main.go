@@ -173,6 +173,7 @@ func run(cfg config.Config, log *slog.Logger) error {
 			Store:             db,
 			WebhookStore:      db,
 			WebhookAdminToken: cfg.WebhookAdminToken,
+			WebhookAPIKeys:    cfg.WebhookAPIKeys,
 			WebhookCodec:      webhookCodec,
 			Network: api.NetworkInfo{
 				NetworkPassphrase:  cfg.NetworkPassphrase,

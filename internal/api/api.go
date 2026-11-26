@@ -3,6 +3,7 @@ package api
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/subtle"
 	_ "embed"
 	"encoding/hex"
@@ -55,6 +56,7 @@ type Server struct {
 	Store             Reader
 	WebhookStore      WebhookManager
 	WebhookAdminToken string
+	WebhookAPIKeys    []string
 	WebhookCodec      *webhook.SecretCodec
 	Network           NetworkInfo
 	CORS              []string
@@ -66,9 +68,9 @@ type Server struct {
 }
 
 type WebhookManager interface {
-	CreateWebhook(context.Context, string, string, []byte) (store.Webhook, error)
+	CreateWebhook(context.Context, string, string, []byte, string) (store.Webhook, error)
 	ListWebhooks(context.Context) ([]store.Webhook, error)
-	DeleteWebhook(context.Context, int64) (bool, error)
+	DeleteWebhook(ctx context.Context, id int64, ownerKeyHash string, allowLegacyAdmin bool) error
 }
 
 func (s *Server) Handler() http.Handler {
@@ -403,7 +405,11 @@ func (s *Server) breakdown(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) createWebhook(w http.ResponseWriter, r *http.Request) {
-	if !s.webhookConfigured(w) || !s.authorizeWebhookAdmin(w, r) {
+	if !s.webhookConfigured(w) {
+		return
+	}
+	ownerKeyHash, _, ok := s.authorizeWebhookAPIKey(w, r)
+	if !ok {
 		return
 	}
 	body, err := io.ReadAll(io.LimitReader(r.Body, 4097))
@@ -439,7 +445,7 @@ func (s *Server) createWebhook(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, err)
 		return
 	}
-	created, err := s.WebhookStore.CreateWebhook(r.Context(), input.URL, webhook.SecretHash(secret), ciphertext)
+	created, err := s.WebhookStore.CreateWebhook(r.Context(), input.URL, webhook.SecretHash(secret), ciphertext, ownerKeyHash)
 	if err != nil {
 		s.fail(w, err)
 		return
@@ -467,7 +473,11 @@ func (s *Server) listWebhooks(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) deleteWebhook(w http.ResponseWriter, r *http.Request) {
-	if !s.webhookConfigured(w) || !s.authorizeWebhookAdmin(w, r) {
+	if !s.webhookConfigured(w) {
+		return
+	}
+	ownerKeyHash, isAdmin, ok := s.authorizeWebhookAPIKey(w, r)
+	if !ok {
 		return
 	}
 	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
@@ -476,13 +486,17 @@ func (s *Server) deleteWebhook(w http.ResponseWriter, r *http.Request) {
 			"webhook id must be a positive integer", map[string]any{"id": r.PathValue("id")})
 		return
 	}
-	deleted, err := s.WebhookStore.DeleteWebhook(r.Context(), id)
-	if err != nil {
-		s.fail(w, err)
+	err = s.WebhookStore.DeleteWebhook(r.Context(), id, ownerKeyHash, isAdmin)
+	if errors.Is(err, store.ErrNotFound) {
+		writeError(w, http.StatusNotFound, codeWebhookNotFound, "webhook not found")
 		return
 	}
-	if !deleted {
-		writeError(w, http.StatusNotFound, codeWebhookNotFound, "webhook not found")
+	if errors.Is(err, store.ErrForbidden) {
+		writeError(w, http.StatusForbidden, codeWebhookForbidden, "API key does not own this webhook")
+		return
+	}
+	if err != nil {
+		s.fail(w, err)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -497,13 +511,46 @@ func (s *Server) webhookConfigured(w http.ResponseWriter) bool {
 }
 
 func (s *Server) authorizeWebhookAdmin(w http.ResponseWriter, r *http.Request) bool {
-	token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-	if token == r.Header.Get("Authorization") || len(token) != len(s.WebhookAdminToken) ||
-		subtle.ConstantTimeCompare([]byte(token), []byte(s.WebhookAdminToken)) != 1 {
+	token, ok := bearerToken(r)
+	if !ok || !sameToken(token, s.WebhookAdminToken) {
 		writeError(w, http.StatusUnauthorized, codeUnauthorized, "unauthorized")
 		return false
 	}
 	return true
+}
+
+func (s *Server) authorizeWebhookAPIKey(w http.ResponseWriter, r *http.Request) (string, bool, bool) {
+	token, ok := bearerToken(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, codeUnauthorized, "unauthorized")
+		return "", false, false
+	}
+	if sameToken(token, s.WebhookAdminToken) {
+		return webhookAPIKeyHash(token), true, true
+	}
+	for _, key := range s.WebhookAPIKeys {
+		if sameToken(token, key) {
+			return webhookAPIKeyHash(token), false, true
+		}
+	}
+	writeError(w, http.StatusUnauthorized, codeUnauthorized, "unauthorized")
+	return "", false, false
+}
+
+func bearerToken(r *http.Request) (string, bool) {
+	header := r.Header.Get("Authorization")
+	token := strings.TrimPrefix(header, "Bearer ")
+	return token, token != header && token != ""
+}
+
+func sameToken(token, expected string) bool {
+	return len(token) == len(expected) &&
+		subtle.ConstantTimeCompare([]byte(token), []byte(expected)) == 1
+}
+
+func webhookAPIKeyHash(key string) string {
+	sum := sha256.Sum256([]byte(key))
+	return hex.EncodeToString(sum[:])
 }
 
 // ---- helpers --------------------------------------------------------------
@@ -629,6 +676,7 @@ const (
 	codeInvalidWebhookURL     = "invalid_webhook_url"
 	codeInvalidWebhookID      = "invalid_webhook_id"
 	codeWebhookNotFound       = "webhook_not_found"
+	codeWebhookForbidden      = "webhook_forbidden"
 	codeWebhooksNotConfigured = "webhooks_not_configured"
 	codeUnauthorized          = "unauthorized"
 	codeInternal              = "internal_error"

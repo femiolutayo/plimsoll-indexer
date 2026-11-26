@@ -16,6 +16,7 @@ import (
 )
 
 var ErrNotFound = errors.New("not found")
+var ErrForbidden = errors.New("forbidden")
 
 // ErrLockNotAcquired is returned by TryPostLock when another poster instance
 // already holds the advisory lock.
@@ -30,6 +31,7 @@ type Webhook struct {
 	URL              string
 	SecretHash       string
 	SecretCiphertext []byte
+	OwnerKeyHash     string
 	CreatedAt        time.Time
 }
 
@@ -404,14 +406,14 @@ func (s *Store) SaveIssuerTomlSnapshot(ctx context.Context, issuer, domain, hash
 	return oldHash, changed, nil
 }
 
-func (s *Store) CreateWebhook(ctx context.Context, url, secretHash string, ciphertext []byte) (Webhook, error) {
+func (s *Store) CreateWebhook(ctx context.Context, url, secretHash string, ciphertext []byte, ownerKeyHash string) (Webhook, error) {
 	var w Webhook
 	err := s.pool.QueryRow(ctx, `
-		INSERT INTO webhooks (url, secret_hash, secret_ciphertext)
-		VALUES ($1, $2, $3)
-		RETURNING id, url, secret_hash, secret_ciphertext, created_at`,
-		url, secretHash, ciphertext,
-	).Scan(&w.ID, &w.URL, &w.SecretHash, &w.SecretCiphertext, &w.CreatedAt)
+		INSERT INTO webhooks (url, secret_hash, secret_ciphertext, owner_key_hash)
+		VALUES ($1, $2, $3, $4)
+		RETURNING id, url, secret_hash, secret_ciphertext, owner_key_hash, created_at`,
+		url, secretHash, ciphertext, ownerKeyHash,
+	).Scan(&w.ID, &w.URL, &w.SecretHash, &w.SecretCiphertext, &w.OwnerKeyHash, &w.CreatedAt)
 	if err != nil {
 		return Webhook{}, fmt.Errorf("create webhook: %w", err)
 	}
@@ -437,12 +439,32 @@ func (s *Store) ListWebhooks(ctx context.Context) ([]Webhook, error) {
 	return out, rows.Err()
 }
 
-func (s *Store) DeleteWebhook(ctx context.Context, id int64) (bool, error) {
-	tag, err := s.pool.Exec(ctx, `DELETE FROM webhooks WHERE id = $1`, id)
+func (s *Store) DeleteWebhook(ctx context.Context, id int64, ownerKeyHash string, allowLegacyAdmin bool) error {
+	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return false, fmt.Errorf("delete webhook: %w", err)
+		return fmt.Errorf("begin delete webhook: %w", err)
 	}
-	return tag.RowsAffected() != 0, nil
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var storedOwner string
+	err = tx.QueryRow(ctx, `SELECT owner_key_hash FROM webhooks WHERE id = $1 FOR UPDATE`, id).Scan(&storedOwner)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrNotFound
+	}
+	if err != nil {
+		return fmt.Errorf("read webhook owner: %w", err)
+	}
+	// Rows created before owner tracking have no key hash and are admin-only.
+	if storedOwner != ownerKeyHash && !(storedOwner == "" && allowLegacyAdmin) {
+		return ErrForbidden
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM webhooks WHERE id = $1`, id); err != nil {
+		return fmt.Errorf("delete webhook: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit delete webhook: %w", err)
+	}
+	return nil
 }
 
 func mustBig(s string) *big.Int {

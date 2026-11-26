@@ -10,6 +10,7 @@ import (
 	"math/big"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -103,10 +104,10 @@ type webhookManagerFake struct {
 	webhooks []store.Webhook
 }
 
-func (f *webhookManagerFake) CreateWebhook(_ context.Context, url, hash string, ciphertext []byte) (store.Webhook, error) {
+func (f *webhookManagerFake) CreateWebhook(_ context.Context, url, hash string, ciphertext []byte, ownerKeyHash string) (store.Webhook, error) {
 	item := store.Webhook{
 		ID: int64(len(f.webhooks) + 1), URL: url, SecretHash: hash,
-		SecretCiphertext: ciphertext, CreatedAt: now,
+		SecretCiphertext: ciphertext, OwnerKeyHash: ownerKeyHash, CreatedAt: now,
 	}
 	f.webhooks = append(f.webhooks, item)
 	return item, nil
@@ -116,14 +117,17 @@ func (f *webhookManagerFake) ListWebhooks(context.Context) ([]store.Webhook, err
 	return f.webhooks, nil
 }
 
-func (f *webhookManagerFake) DeleteWebhook(_ context.Context, id int64) (bool, error) {
+func (f *webhookManagerFake) DeleteWebhook(_ context.Context, id int64, ownerKeyHash string, allowLegacyAdmin bool) error {
 	for i, item := range f.webhooks {
 		if item.ID == id {
+			if item.OwnerKeyHash != ownerKeyHash && !(item.OwnerKeyHash == "" && allowLegacyAdmin) {
+				return store.ErrForbidden
+			}
 			f.webhooks = append(f.webhooks[:i], f.webhooks[i+1:]...)
-			return true, nil
+			return nil
 		}
 	}
-	return false, nil
+	return store.ErrNotFound
 }
 
 func server() *httptest.Server {
@@ -149,6 +153,7 @@ func serverWithWebhooks(manager WebhookManager, codec *webhook.SecretCodec, toke
 		WebhookStore:      manager,
 		WebhookCodec:      codec,
 		WebhookAdminToken: token,
+		WebhookAPIKeys:    []string{"owner-token", "other-owner-token"},
 		CORS:              []string{"*"},
 		Log:               slog.New(slog.NewTextHandler(io.Discard, nil)),
 		Now:               func() time.Time { return now },
@@ -446,7 +451,7 @@ func TestWebhookSecretReturnedOnlyAtCreation(t *testing.T) {
 	srv := serverWithWebhooks(manager, codec, "admin-token")
 	defer srv.Close()
 
-	request := func(method, path, body string, authorized bool) *http.Response {
+	request := func(method, path, body, token string) *http.Response {
 		t.Helper()
 		req, err := http.NewRequest(method, srv.URL+path, strings.NewReader(body))
 		if err != nil {
@@ -455,8 +460,8 @@ func TestWebhookSecretReturnedOnlyAtCreation(t *testing.T) {
 		if body != "" {
 			req.Header.Set("Content-Type", "application/json")
 		}
-		if authorized {
-			req.Header.Set("Authorization", "Bearer admin-token")
+		if token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
 		}
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
@@ -465,7 +470,7 @@ func TestWebhookSecretReturnedOnlyAtCreation(t *testing.T) {
 		return resp
 	}
 
-	unauthorized := request(http.MethodPost, "/v1/webhooks", `{"url":"https://receiver.example/hook"}`, false)
+	unauthorized := request(http.MethodPost, "/v1/webhooks", `{"url":"https://receiver.example/hook"}`, "")
 	var unauthorizedBody errorBody
 	if err := json.NewDecoder(unauthorized.Body).Decode(&unauthorizedBody); err != nil {
 		t.Fatal(err)
@@ -475,7 +480,7 @@ func TestWebhookSecretReturnedOnlyAtCreation(t *testing.T) {
 		t.Fatalf("unauthorized create = %d %+v, want 401 unauthorized", unauthorized.StatusCode, unauthorizedBody)
 	}
 
-	created := request(http.MethodPost, "/v1/webhooks", `{"url":"https://receiver.example/hook"}`, true)
+	created := request(http.MethodPost, "/v1/webhooks", `{"url":"https://receiver.example/hook"}`, "owner-token")
 	defer created.Body.Close()
 	if created.StatusCode != http.StatusCreated {
 		t.Fatalf("create status = %d, want 201", created.StatusCode)
@@ -494,12 +499,15 @@ func TestWebhookSecretReturnedOnlyAtCreation(t *testing.T) {
 	if stored.SecretHash != webhook.SecretHash(response.Secret) {
 		t.Fatal("stored secret hash does not match the one-time returned secret")
 	}
+	if stored.OwnerKeyHash != webhook.SecretHash("owner-token") {
+		t.Fatal("stored owner key hash does not match the creating API key")
+	}
 	decrypted, err := codec.Decrypt(stored.SecretCiphertext)
 	if err != nil || decrypted != response.Secret {
 		t.Fatalf("stored signing secret = %q, %v", decrypted, err)
 	}
 
-	list := request(http.MethodGet, "/v1/webhooks", "", true)
+	list := request(http.MethodGet, "/v1/webhooks", "", "admin-token")
 	defer list.Body.Close()
 	listBody, err := io.ReadAll(list.Body)
 	if err != nil {
@@ -508,5 +516,40 @@ func TestWebhookSecretReturnedOnlyAtCreation(t *testing.T) {
 	if list.StatusCode != http.StatusOK || strings.Contains(string(listBody), response.Secret) ||
 		strings.Contains(string(listBody), "secret_hash") || strings.Contains(string(listBody), "secret_ciphertext") {
 		t.Fatalf("list response disclosed secret or failed: status=%d body=%s", list.StatusCode, listBody)
+	}
+
+	deleteWebhook := func(token, path string) *http.Response {
+		t.Helper()
+		return request(http.MethodDelete, path, "", token)
+	}
+	notOwner := deleteWebhook("other-owner-token", "/v1/webhooks/"+strconv.FormatInt(response.ID, 10))
+	var forbidden errorBody
+	if err := json.NewDecoder(notOwner.Body).Decode(&forbidden); err != nil {
+		t.Fatal(err)
+	}
+	notOwner.Body.Close()
+	if notOwner.StatusCode != http.StatusForbidden || forbidden.Code != "webhook_forbidden" {
+		t.Fatalf("non-owner delete = %d %+v, want 403 webhook_forbidden", notOwner.StatusCode, forbidden)
+	}
+
+	unknown := deleteWebhook("owner-token", "/v1/webhooks/999")
+	unknown.Body.Close()
+	if unknown.StatusCode != http.StatusNotFound {
+		t.Fatalf("unknown webhook delete = %d, want 404", unknown.StatusCode)
+	}
+
+	deleted := deleteWebhook("owner-token", "/v1/webhooks/"+strconv.FormatInt(response.ID, 10))
+	deleted.Body.Close()
+	if deleted.StatusCode != http.StatusNoContent {
+		t.Fatalf("owner delete = %d, want 204", deleted.StatusCode)
+	}
+	again := deleteWebhook("owner-token", "/v1/webhooks/"+strconv.FormatInt(response.ID, 10))
+	var missing errorBody
+	if err := json.NewDecoder(again.Body).Decode(&missing); err != nil {
+		t.Fatal(err)
+	}
+	again.Body.Close()
+	if again.StatusCode != http.StatusNotFound || missing.Code != "webhook_not_found" {
+		t.Fatalf("repeated delete = %d %+v, want 404 webhook_not_found", again.StatusCode, missing)
 	}
 }

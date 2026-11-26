@@ -299,6 +299,7 @@ paths:
       operationId: createWebhook
       security:
         - WebhookAdminAuth: []
+        - WebhookOwnerAuth: []
       requestBody:
         required: true
         content:
@@ -325,7 +326,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
         '401':
-          description: Missing or invalid administrator token
+          description: Missing or invalid API key
           content:
             application/json:
               schema:
@@ -368,10 +369,11 @@ paths:
                 $ref: '#/components/schemas/ErrorResponse'
   /v1/webhooks/{id}:
     delete:
-      summary: Delete a registered webhook
+      summary: Delete a webhook owned by the API key
       operationId: deleteWebhook
       security:
         - WebhookAdminAuth: []
+        - WebhookOwnerAuth: []
       parameters:
         - name: id
           in: path
@@ -389,13 +391,19 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
         '401':
-          description: Missing or invalid administrator token
+          description: Missing or invalid API key
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: The API key does not own this webhook
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
         '404':
-          description: Webhook not found
+          description: Webhook not found or already deleted
           content:
             application/json:
               schema:
@@ -436,6 +444,11 @@ components:
     WebhookAdminAuth:
       type: http
       scheme: bearer
+      description: Configured administrator bearer token; required to list webhooks.
+    WebhookOwnerAuth:
+      type: http
+      scheme: bearer
+      description: One of the configured owner API keys; can create and delete its own webhooks.
   schemas:
     NetworkInfo:
       type: object
@@ -715,6 +728,7 @@ components:
             asset_not_listed, invalid_breakdown_hash, breakdown_not_found,
             invalid_min_tier, invalid_limit, invalid_body,
             invalid_webhook_url, invalid_webhook_id, webhook_not_found,
+            webhook_forbidden,
             webhooks_not_configured, unauthorized, internal_error,
             db_unavailable and progress_unavailable. The router uses
             not_found, method_not_allowed and internal_error.

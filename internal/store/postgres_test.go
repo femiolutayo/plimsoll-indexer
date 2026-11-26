@@ -3,6 +3,7 @@ package store
 import (
 	"bytes"
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"math/big"
@@ -195,27 +196,53 @@ func TestWebhookPersistence(t *testing.T) {
 	s, _ := openStore(t)
 	ctx := context.Background()
 	ciphertext := []byte{1, 2, 3, 4}
-	created, err := s.CreateWebhook(ctx, "https://receiver.example/hook", "sha256-hash", ciphertext)
+	ownerKeyHash := "owner-key-hash"
+	created, err := s.CreateWebhook(ctx, "https://receiver.example/hook", "sha256-hash", ciphertext, ownerKeyHash)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if created.ID < 1 || created.SecretHash != "sha256-hash" || !bytes.Equal(created.SecretCiphertext, ciphertext) {
+	if created.ID < 1 || created.SecretHash != "sha256-hash" || created.OwnerKeyHash != ownerKeyHash ||
+		!bytes.Equal(created.SecretCiphertext, ciphertext) {
 		t.Fatalf("created webhook = %+v", created)
 	}
 
+	if err := s.DeleteWebhook(ctx, created.ID, "different-owner", false); !errors.Is(err, ErrForbidden) {
+		t.Fatalf("delete webhook as non-owner: err=%v, want ErrForbidden", err)
+	}
+	if err := s.DeleteWebhook(ctx, created.ID, ownerKeyHash, false); err != nil {
+		t.Fatalf("delete webhook as owner: %v", err)
+	}
+	if err := s.DeleteWebhook(ctx, created.ID, ownerKeyHash, false); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("delete missing webhook: err=%v, want ErrNotFound", err)
+	}
+
 	list, err := s.ListWebhooks(ctx)
-	if err != nil || len(list) != 1 || list[0].ID != created.ID ||
+	if err != nil || len(list) != 0 {
+		t.Fatalf("listed webhooks after delete = %+v, %v", list, err)
+	}
+	if _, err := s.CreateWebhook(ctx, "https://receiver.example/hook", "sha256-hash", ciphertext, ownerKeyHash); err != nil {
+		t.Fatal(err)
+	}
+	list, err = s.ListWebhooks(ctx)
+	if err != nil || len(list) != 1 ||
 		list[0].URL != created.URL || list[0].SecretHash != created.SecretHash ||
 		!bytes.Equal(list[0].SecretCiphertext, ciphertext) {
 		t.Fatalf("listed webhooks = %+v, %v", list, err)
 	}
-	deleted, err := s.DeleteWebhook(ctx, created.ID)
-	if err != nil || !deleted {
-		t.Fatalf("delete webhook: deleted=%v err=%v", deleted, err)
+
+	var legacyID int64
+	err = s.pool.QueryRow(ctx, `
+		INSERT INTO webhooks (url, secret_hash, secret_ciphertext)
+		VALUES ('https://legacy.example/hook', 'legacy-hash', $1)
+		RETURNING id`, ciphertext).Scan(&legacyID)
+	if err != nil {
+		t.Fatal(err)
 	}
-	deleted, err = s.DeleteWebhook(ctx, created.ID)
-	if err != nil || deleted {
-		t.Fatalf("delete missing webhook: deleted=%v err=%v", deleted, err)
+	if err := s.DeleteWebhook(ctx, legacyID, "owner-key-hash", false); !errors.Is(err, ErrForbidden) {
+		t.Fatalf("delete legacy webhook as owner key: err=%v, want ErrForbidden", err)
+	}
+	if err := s.DeleteWebhook(ctx, legacyID, "admin-key-hash", true); err != nil {
+		t.Fatalf("delete legacy webhook as admin: %v", err)
 	}
 }
 
