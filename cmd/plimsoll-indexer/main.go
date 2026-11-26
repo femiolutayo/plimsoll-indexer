@@ -77,6 +77,7 @@ func run(cfg config.Config, log *slog.Logger) error {
 		Store:       db,
 		ContractIDs: []string{cfg.CoverageLedgerID, cfg.ReporterRegistryID},
 		StartLedger: cfg.StartLedger,
+		Workers:     cfg.IngestWorkers,
 		Log:         log.With("job", "ingest"),
 	}
 	// Ingest once before the other jobs start, so they see the listed assets.

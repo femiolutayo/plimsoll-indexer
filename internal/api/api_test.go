@@ -41,10 +41,11 @@ func unlistedSAC(t *testing.T) string {
 }
 
 type fake struct {
-	assets  []coverage.Asset
-	supply  map[string]*coverage.Supply
-	reports map[string]map[uint32]coverage.Report
-	bodies  map[string][]byte
+	assets   []coverage.Asset
+	supply   map[string]*coverage.Supply
+	reports  map[string]map[uint32]coverage.Report
+	bodies   map[string][]byte
+	progress map[string]store.Progress
 }
 
 func (f *fake) Ping(context.Context) error { return nil }
@@ -90,13 +91,58 @@ func (f *fake) Breakdown(_ context.Context, h string) ([]byte, error) {
 	}
 	return nil, store.ErrNotFound
 }
-func (f *fake) Progress(context.Context, string) (store.Progress, error) {
+func (f *fake) Progress(_ context.Context, name string) (store.Progress, error) {
+	if p, ok := f.progress[name]; ok {
+		return p, nil
+	}
 	return store.Progress{
 		Cursor:        "c",
 		ScannedLedger: 42,
 		EventLedger:   40,
 		EventAt:       now.Add(-90 * time.Second),
 	}, nil
+}
+
+func TestHealthAggregatesContractStreamProgress(t *testing.T) {
+	f := &fake{
+		progress: map[string]store.Progress{
+			store.LegacyIngestCursorName: {
+				ScannedLedger: 90,
+				EventLedger:   80,
+				EventAt:       now.Add(-time.Hour),
+			},
+			store.ContractIngestCursorName("coverage"): {
+				ScannedLedger: 120,
+				EventLedger:   100,
+				EventAt:       now.Add(-2 * time.Minute),
+			},
+			store.ContractIngestCursorName("registry"): {
+				ScannedLedger: 110,
+				EventLedger:   105,
+				EventAt:       now.Add(-time.Minute),
+			},
+		},
+	}
+	srv := httptest.NewServer((&Server{
+		Store: f,
+		Network: NetworkInfo{
+			CoverageLedgerID:   "coverage",
+			ReporterRegistryID: "registry",
+		},
+		Now: func() time.Time { return now },
+	}).Handler())
+	defer srv.Close()
+
+	body := get(t, srv, "/healthz", http.StatusOK)
+	if body["ingested_to_ledger"].(float64) != 110 {
+		t.Errorf("ingested_to_ledger = %v, want lagging stream ledger 110", body["ingested_to_ledger"])
+	}
+	if body["last_event_ledger"].(float64) != 105 {
+		t.Errorf("last_event_ledger = %v, want 105", body["last_event_ledger"])
+	}
+	if body["last_event_age_seconds"].(float64) != 60 {
+		t.Errorf("last_event_age_seconds = %v, want 60", body["last_event_age_seconds"])
+	}
 }
 
 type webhookManagerFake struct {

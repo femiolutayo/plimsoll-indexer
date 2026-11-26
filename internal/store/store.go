@@ -63,6 +63,14 @@ func (s *Store) Ping(ctx context.Context) error { return s.pool.Ping(ctx) }
 
 // ---- ingest cursor --------------------------------------------------------
 
+// LegacyIngestCursorName is the pre-streaming cursor retained for upgrades.
+const LegacyIngestCursorName = "plimsoll-events"
+
+// ContractIngestCursorName returns the checkpoint name for one event stream.
+func ContractIngestCursorName(contractID string) string {
+	return LegacyIngestCursorName + ":" + contractID
+}
+
 // Progress is how far ingestion has reached.
 type Progress struct {
 	// Cursor and ScannedLedger advance on every page, empty pages included.

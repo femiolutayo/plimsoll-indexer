@@ -157,6 +157,30 @@ func TestLoadDefaults(t *testing.T) {
 	if got.KeepAwakeInterval.String() != "10m0s" {
 		t.Errorf("KeepAwakeInterval = %v, want 10m0s", got.KeepAwakeInterval)
 	}
+	if got.IngestWorkers != 2 {
+		t.Errorf("IngestWorkers = %d, want 2", got.IngestWorkers)
+	}
+}
+
+func TestLoadIngestWorkers(t *testing.T) {
+	for _, value := range []string{"0", "-1", "many"} {
+		t.Run(value, func(t *testing.T) {
+			setBase(t)
+			t.Setenv("INGEST_WORKERS", value)
+			if _, err := Load(); err == nil || !strings.Contains(err.Error(), "INGEST_WORKERS") {
+				t.Fatalf("want INGEST_WORKERS validation error, got %v", err)
+			}
+		})
+	}
+	setBase(t)
+	t.Setenv("INGEST_WORKERS", "1")
+	got, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.IngestWorkers != 1 {
+		t.Errorf("IngestWorkers = %d, want 1", got.IngestWorkers)
+	}
 }
 
 // TestLoadRequiredMissing checks that each required variable produces an error

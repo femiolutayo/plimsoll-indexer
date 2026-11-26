@@ -189,10 +189,40 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, codeDBUnavailable, "database is unavailable")
 		return
 	}
-	p, err := s.Store.Progress(r.Context(), "plimsoll-events")
+	p, err := s.Store.Progress(r.Context(), store.LegacyIngestCursorName)
 	if err != nil {
 		writeError(w, http.StatusServiceUnavailable, codeProgressUnavailable, "ingest progress is unavailable")
 		return
+	}
+	if s.Network.CoverageLedgerID != "" && s.Network.ReporterRegistryID != "" {
+		ids := []string{s.Network.CoverageLedgerID, s.Network.ReporterRegistryID}
+		scanned := make([]uint32, 0, len(ids))
+		var eventLedger uint32
+		eventAt := p.EventAt
+		for _, id := range ids {
+			stream, err := s.Store.Progress(r.Context(), store.ContractIngestCursorName(id))
+			if err != nil {
+				writeError(w, http.StatusServiceUnavailable, codeProgressUnavailable, "ingest progress is unavailable")
+				return
+			}
+			scanned = append(scanned, stream.ScannedLedger)
+			if stream.EventLedger > eventLedger {
+				eventLedger = stream.EventLedger
+			}
+			if stream.EventAt.After(eventAt) {
+				eventAt = stream.EventAt
+			}
+		}
+		p.ScannedLedger = scanned[0]
+		for _, ledger := range scanned[1:] {
+			if ledger < p.ScannedLedger {
+				p.ScannedLedger = ledger
+			}
+		}
+		if eventLedger > p.EventLedger {
+			p.EventLedger = eventLedger
+		}
+		p.EventAt = eventAt
 	}
 	body := map[string]any{
 		"status":             "ok",
